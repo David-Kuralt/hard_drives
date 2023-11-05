@@ -1,0 +1,149 @@
+---
+title: "Final Project COMP 4441 Fall 2020"
+author: "David Kuralt"
+date: "10/26/2020"
+output: pdf_document
+urlcolor: blue
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(survminer)
+library(survival)
+```
+Backblaze is a company that backs up data for corporate and individual clients. It maintains tens of thousands of hard drives, and publishes data every quarter which shows a daily "snapshot" of the status of each and every one of their hard drives. The snapshot consists of data provided by each hard drive, itself, using SMART or Self-Monitoring Analysis and Reporting Technology. In this report, we choose two of the models used by Backblaze and compare the reliability, or survival of these hard drives. 
+
+We study the performance of the TOSHIBA MG07ACA14TA (Toshiba MG Series Enterprise with 14 TB capacity) and ST12000NM0008 (Seagate Exos X14 with 12 TB capacity) hard drives. Our objective is to determine if one or the other of the two hard drive models is more likely to fail. We are also interested in how other attributes of these hard drives may affect the probability of failure. We discuss these attributes later on.
+
+We use principles of survival analysis to conduct our study based on daily records of hard drive data from October 1, 2019 through September 30, 2020. We choose the Toshiba MG and the Seagate Exos for our analysis because Backblaze has a comparable number of each model, and because there are a comparable number of failures of each model of hard drive over the course of the year. We define $\textbf{failure}$ to mean any malfunction severe enough that it is necessary to replace the hard drive.
+
+To gather the data, we visit [Backblaze](https://www.backblaze.com/b2/hard-drive-test-data.html) and download four ZIP files, data_Q4_2019, data_Q1_2020, data_Q2_2020 and data_Q3_2020. As the file names suggest, the data are available by quarter. Each ZIP file contains an Excel CSV spreadsheet for each day of the quarter with the SMART data from every single hard drive in operation that day. There is also a failure indicator for each hard drive that shows 0 if the hard drive did not fail that day and 1 otherwise.
+
+To harvest the data, we write two Python programs. The first creates a CSV file called harddrive_begin_status and it contains a date and serial number of each of the Toshiba and Seagate hard drives involved in this study. The date represents either the beginning of the observation period, 1 October 2019, or the first day during the year that the hard drive was brought online. The second program creates a CSV file called harddrive_end_status, which represents the last day data were collected from each hard drive. For the vast majority of the hard drives we observe, the last day is the end of the observation period, 30 September 2020. Otherwise, the last day is either the day that the hard drive failed, or the last day that a hard drive was online before being replaced for a reason other than failure.
+
+Below we show some figures associated with the data we collected.
+```{r echo=FALSE}
+data.begin <- read.csv("harddrive_begin_status")
+data.end <- read.csv("harddrive_end_status")
+
+paste("Number of Toshiba hard drives:",
+      toString(nrow(data.begin[data.begin$model=="TOSHIBA MG07ACA14TA",])))
+paste("Number of Toshiba hard drives that failed:",
+      toString(nrow(data.end[data.end$model=="TOSHIBA MG07ACA14TA" & 
+                               data.end$fail_status==1,])))
+paste("Number of Toshiba hard drives that were removed but did not fail:",
+      toString(nrow(data.end[data.end$model=="TOSHIBA MG07ACA14TA" & 
+                               data.end$fail_status!=1 &
+                               as.Date(data.end$date)<as.Date("2020-09-30"),])))
+paste("Number of Seagate hard drives:",
+      toString(nrow(data.begin[data.begin$model=="ST12000NM0008",])))
+paste("Number of Seagate hard drives that failed:",
+      toString(nrow(data.end[data.end$model=="ST12000NM0008" & 
+                               data.end$fail_status==1,])))
+paste("Number of Seagate hard drives that were removed but did not fail:",
+      toString(nrow(data.end[data.end$model=="ST12000NM0008" & 
+                               data.end$fail_status!=1 &
+                               as.Date(data.end$date)<as.Date("2020-09-30"),])))
+
+
+```
+We treat the study of the hard drives as one might treat the study of the effectiveness of a treatment on medical patients. There is an $\textbf{observation period}$ for this study, from October 1, 2019 through September 30, 2020. During this time hard drives are brought online and thus enter the study. They are taken offline when they fail, and sometimes they are simply replaced without ever having suffered a fatal malfunction. Hard drives that leave the study for a reason other than death, or who remain in the study for the entire observation period without dying are said to be $\textbf{censored}$. Hard drives that fail during the observation period are said to have an $\textbf{event}$. Most of the hard drives in this study are censored, since the vast majority of the hard drives never experience an event during the observation period.
+
+We begin by examining Kaplan Meier curves for each model of hard drive. A Kaplan Meier curve is an approximation of the $\textbf{survival function}$, which gives the probability that an event has not occurred before time $t$. When $t=0$, this probability is 1, and gradually decreases throughout the observation period as hard drives fail. The Kaplan Meier curves for each model are shown below.
+
+
+```{r include=FALSE}
+# Arranging the rows of each data frame by serial number
+data.begin <- arrange(data.begin, data.begin$serial_number)
+data.end <- arrange(data.end, data.end$serial_number)
+
+# Joining data.begin and data.end by serial number and model
+data <- full_join(data.begin, data.end)
+data <- rename(data, end_date=date)
+
+# Adding a new column to data called days to show the number of days each
+# hard drive was observed during the period.
+data["days"] <- as.Date(data$end_date) - as.Date(data$start_date)
+
+# Arranging the rows of data in order of increasing days
+data <- arrange(data, data$days)
+
+# Replacing the NA values for the SMART columns with 0.
+data <- replace_na(data, list(smart_5 = 0, smart_187 = 0, 
+                         smart_188 = 0, smart_197 = 0,
+                         smart_198 = 0, hours_running=0))
+
+# Adding a sum_errors column to data
+data["sum_errors"] <- data$smart_5+data$smart_187+data$smart_188+
+  data$smart_197+data$smart_198
+
+func.error <- function(x) {
+  if (x>0) {
+    return("some reported")
+  }
+  else {
+    return("none reported")
+  }
+}
+
+# Adding a column to distinguish between some SMART errors reported and none
+data["errors"] <- sapply(data$sum_errors, FUN = func.error)
+
+func.run <- function(x) {
+  if (x<=4785) {
+    return("short")
+  }
+  else {
+    return("long")
+  }
+}
+
+# Adding a column to determine if a hard drive has run for a "long" time or a
+# "short" time.
+data["runtime"] <- sapply(data$hours_running, FUN = func.run)
+
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+surv.object <- Surv(time=strtoi(data$days),
+                    event=strtoi(data$fail_status))
+fit1 <- survfit(formula=surv.object~model, data=data)
+g <- ggsurvplot(fit1, data=data, ylim=c(0.99,1), palette=c("red","blue"))
+g
+
+```
+The vertical tick marks represent times when censored hard drives enter our study, while each vertical decrease in the curve represents a hard drive failure. Notice that time is measured in days, and that the survival probability decreases by less than 0.001 for each model over the course of the year. 
+
+We want to analyze these Kaplan Meier curves to determine if either the Toshiba hard drive or Seagate hard drive is more likely to fail. We conduct this analysis with a log rank test, which is a special case of the chi-square test. The null hypothesis is that the survival functions are the same for each model. The result of the log rank test for these curves is shown below.
+```{r echo=FALSE}
+# the log rank test:
+survdiff(formula=surv.object~data$model)
+```
+The p-value of the log rank test gives us no reason to reject the null hypothesis, and it appears so far that neither model is more likely than the other to fail. But we have considered hard drive model as the only contributing factor in predicting failure.
+
+What other factors might influence the probability of hard drive failure? One of the SMART measurements is Power-On Hours. This measurement is simply the total number of hours that the hard drive has been running. Are hard drives that have run for many hours more likely to fail than hard drives that have run for fewer hours? How do we decide how many hours is "many?" 
+
+Are there other SMART attributes that we could consider? In a 2016 article found at [Backblaze](https://www.backblaze.com/blog/what-smart-stats-indicate-hard-drive-failures),
+Andy Klein lists five SMART measurements that can be indicative of a hard drive that is about to fail. These measurements are SMART 5, Reallocated Sectors Count; SMART 187, Reported Uncorrectable Errors; SMART 188, Command Timeout; SMART 197, Current Pending Sector Count; and SMART 198, Uncorrectable Sector Count. More information can be found on what these measurements mean at [Wikipedia](https://en.wikipedia.org/wiki/S.M.A.R.T.#ATA_S.M.A.R.T._attributes). Essentially, these SMART attributes are counts of certain types of errors as reported by each hard drive. Klein stresses that a nonzero number for any one of these measurements does not mean that failure is imminent. He reports, however, that when these five categories are considered together, non-zero values in one or more of these categories are present in 76.7% of all hard drive failures. 
+
+Now we have two more $\textbf{covariates}$ to consider in addition to the model of hard drive. These are hard drive run time, and error from any of the five SMART attributes identified above. For simplicity, we only consider two possible values for each covariate. We only consider the Toshiba or the Seagate hard drive models we have been discussing. How do we dichotomize run time? We show a summary of the power-on hours below.
+```{r echo=FALSE}
+summary(data$hours_running)
+```
+The median run time for the hard drives in our study is 4,603 hours, so it seems reasonable to describe larger run times as "long" and run times less than or equal to 4,603 hours as "short." As for the other SMART errors, only 685 of the hard drives in our study show these errors, so for our "error" covariate, the only two possible values are "some reported," and "none reported." 
+
+We use the Cox Proportional Hazards model to conduct our analysis. We have a hazard function given by $h(t)=h_{0}(t)e^{b_{1}x_{1}+b_{2}x_{2}+b_{3}x_{3}}$. $h(t)$ is the estimate of the probability of hard drive failure at time $t$. $x_1, x_2, x_3$ correspond to our covariates, where $x_1$ is 0 for the Seagate hard drive and 1 for the Toshiba hard drive, $x_2$ is 0 for hard drives with none of the five errors described above, and 1 for hard drives with at least one of those errors, and $x_3$ is 0 for hard drives with more than 4,603 hours of run time and 1 for those with 4,603 hours or fewer. The $e^{b_i}$ are called the "effect size" of each covariate, for $i=1,2,3$, and will be estimated by our analysis. $h_{0}(t)$ is the probability of a failure happening at time $t$ when all the covariates have value 0. 
+
+A multiple linear regression is used on the natural logarithm of $h(t)$, since $ln(h(t))=ln(h_{0}(t))+b_{1}x_{1}+b_{2}x_{2}+b_{3}x_{3}$ to give estimates of the effect sizes $b_i$. The R function coxph() performs this multiple regression and is used to provide the summary below.
+```{r echo=FALSE}
+fit.coxph <- coxph(surv.object ~ model + errors + runtime, data=data)
+summary(fit.coxph)
+```
+On the left-hand side of the summary above, the values corresponding to 1 are given for our covariates. The "coef" column gives the regression estimates for $b_1, b_2, b_3$, while the column "exp(coef)" gives the effect size $e^{b_1}, e^{b_2}, e^{b_3}$. 95% confidence intervals are provided for each estimate. Under this analysis, the Toshiba hard drive is between 3 and 4-and-a-half times as likely to fail as the Seagate hard drive. A hard drive that reports at least one of the five errors we discussed is 42 to 78 times as likely to fail as a hard drive that reports none of these errors. Hard drives that have been running for 4,603 or fewer hours are 41 to 126 times as likely to fail as hard drives that have been running longer. The "z" column provides the Wald test statistic for each of our regression coefficients, and p-values are shown
+for each of these. The p-values are based on the null hypothesis that the effect size of each of the covariates is 0, and we have strong evidence here to reject that hypothesis. 
+
+We view these results with some skepticism, however. Specifically, we wonder why such a tiny proportion of the hard drives reported any of the five errors, while the vast majority of hard drives reported none. In examining the data frame "data", one sees a great number of NA values for the SMART_5, SMART_187, SMART_188, SMART_197 and SMART_198. We replaced these values with 0's for the purpose of completing our analysis. We do not know the reasons that so many of the hard drives reported no information for these measures, and we cannot be certain that no errors did occur among these hard drives. In reading Backblaze's articles about these data sets, we learn further that the way specific errors are defined, as well as criteria for reporting these errors, differ from one hard drive manufacturer to the next.
+
+Perhaps the most compelling observation is the sheer number of each model Backblaze had in operation during the year we observed, and that such a small proportion of each model of hard drive failed. We conclude that both the Toshiba and Seagate hard drives are highly reliable.
